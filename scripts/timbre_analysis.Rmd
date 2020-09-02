@@ -1,0 +1,1052 @@
+---
+title: "Bird talk analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Intro
+
+Linguistic analysis of the language of bird vocalizations.
+
+Load libraries:
+
+```{r, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(measurements) # for inch to cm conversion
+library(tidytext) # for unnest_tokens()
+library(textstem) # for lemmatization
+library(lsr) # for Cramer's V effect size
+library(effsize) # for Cohen's D effect size
+library(ranger) # for random forests
+library(wordcloud) # for word cloud
+library(gridExtra) # for multi-plots
+# library(quanteda) # for keyword analysis
+# library(quanteda.textmodels) # for LSA
+# library(lsa) # for LSA
+# library(LSAfun) # for LSA visualization and interpretation
+# library(mclust) # for Gaussian mixture models
+```
+
+Get all file names:
+
+```{r}
+filenames <- list.files(path = '../data/fieldguides/')
+```
+
+Some of the field guides have extra information, such as on abundance. We will disregard this for now and focus on the shared columns "EnglishCommon", "LatinSpecies", "Length", and "Voice".
+
+```{r}
+relevant_cols <- c('EnglishCommon', 'LatinSpecies', 'Length', 'Voice')
+```
+
+Loop through the file names and get the relevant columns from the files. The "Collins Garden Birds" guide has no length information. Also, the "Felix & Hisek" guide has an extra "Song" column that will be merged with the "Voice" column. This is justified because the other guides also combine call and song features in the same section. Moreover, the "Felix & Hisek" guide does not seem to be particularly consistent in separating calls and songs.
+
+```{r, message = FALSE, warning = FALSE}
+birds <- c()
+for (i in seq_along(filenames)) {
+  this_file <- read_csv(str_c('../data/fieldguides/', filenames[i]))
+  
+  # For Felix & Hisek only, merge "Voice" and "Song" columns:
+  
+  if (filenames[i] == 'felix_hisek_birds.csv') {
+    this_file[is.na(this_file$Song), ]$Song <- ''
+    this_file <- mutate(this_file, Voice = str_c(Voice, ' ', Song))
+  }
+  
+  # Get all relevant columns, except for Collins Gem:
+  
+  if (filenames[i] != 'collins_gem_garden_birds.csv') {
+    this_file <- select(this_file, relevant_cols)
+  } else {
+    this_file$Length <- NA
+    this_file <- select(this_file, relevant_cols)
+  }
+  
+  # Append a column with info about the guide:
+  
+  this_file$FieldGuide <- rep(filenames[i], nrow(this_file))
+  
+  # Merge with main data frame that is growing:
+  
+  birds <- rbind(birds, this_file)
+}
+```
+
+Clean the guide column to get rid of ".csv":
+
+```{r}
+birds <- mutate(birds,
+                FieldGuide = str_replace(FieldGuide, '\\.csv', ''))
+```
+
+## Summary information
+
+How many entries altogether?
+
+```{r}
+nrow(birds)
+```
+
+How many per field guide?
+
+```{r}
+table(birds$FieldGuide)
+```
+
+How many bird species?
+
+```{r}
+length(unique(birds$LatinSpecies))
+```
+
+How many per species?
+
+```{r}
+mean(table(birds$LatinSpecies))
+```
+
+Approximating 2 per species...
+
+Look at the ones for which we have most info:
+
+```{r}
+birds %>% count(LatinSpecies, sort = TRUE)
+```
+
+## Process length
+
+Get rid of the "span" information in Morcobe Australia:
+
+```{r}
+aus_length <- str_split(birds[birds$FieldGuide == 'morcombe_australia', ]$Length,
+          pattern = '(; span)|(; includes)', simplify = TRUE)[, 1]
+
+birds[birds$FieldGuide == 'morcombe_australia', ]$Length <- aus_length
+```
+
+Get rid of "cm":
+
+```{r}
+birds <- mutate(birds,
+                Length = str_replace_all(Length, 'cm', ''))
+```
+
+Replace "WS" (wingspan) with NAs for now, to not put apples and oranges together. Will have to find the actual length for these:
+
+```{r}
+birds[which(str_detect(birds$Length, 'WS')), ]$Length <- NA
+```
+
+Loop through and make into numeric, averaging over ranges (e.g., "38-42") and also over male/female:
+
+```{r}
+lengths <- str_extract_all(birds$Length, '([0-9]+\\.5)|([0-9]+)')
+
+birds$Length <- sapply(lengths, FUN = function(x) mean(as.numeric(x)))
+```
+
+Convert Peterson & Chalif inches to cm:
+
+```{r}
+mex_length <- conv_unit(birds[birds$FieldGuide == 'peterson_chalif_mexico', ]$Length,
+          'inch', 'cm')
+
+birds[birds$FieldGuide == 'peterson_chalif_mexico', ]$Length <- mex_length
+```
+
+Create a median split:
+
+```{r}
+birds <- mutate(birds,
+                BigOrSmall = ifelse(!is.na(Length) & Length >= median(Length, na.rm = TRUE),
+                                    'big', 'small'))
+```
+
+Create log length variable:
+
+```{r}
+birds <- mutate(birds,
+                LogLength = log10(Length))
+```
+
+## Process text
+
+Make "Voice" column into lowercase:
+
+```{r}
+birds <- mutate(birds,
+                Voice = str_to_lower(Voice))
+```
+
+Count onomatopoeias, which are always given in double quotation marks ".
+
+```{r}
+birds <- mutate(birds,
+                OnoCount = str_count(Voice, '\\".+?\\"'))
+```
+
+Create a new "VoiceNoOno" colum where the onomatopoeias are replaced by the word "onomatopoeia",
+and those labeled as Warblish (in **) as well.
+
+```{r}
+birds <- mutate(birds,
+                VoiceNew = str_replace_all(Voice, '\\".+?\\"', 'noun'),
+                VoiceNew = str_replace_all(VoiceNew, '\\*.+?\\*', 'noun'))
+```
+
+Make "far carrying" and "high pitched" and "low pitched" into words:
+
+```{r}
+birds <- mutate(birds,
+                VoiceNew = str_replace_all(VoiceNew,
+                                           "far carrying", "far-carrying"),
+                VoiceNew = str_replace_all(VoiceNew,
+                                           "high pitched", "high-pitched"),
+                VoiceNew = str_replace_all(VoiceNew,
+                                           "low pitched", "low-pitched"),
+                VoiceNew = str_replace_all(VoiceNew,
+                                           "cat-like", "catlike"),
+                VoiceNew = str_replace_all(VoiceNew,
+                                           "bugle-like", "buglelike"),
+                VoiceNew = str_replace_all(VoiceNew,
+                                           "flute-like", "flutelike"))
+```
+
+Unnest tokens:
+
+```{r}
+all_tokens <- birds %>% unnest_tokens(Word, VoiceNew, token = 'regex',
+                                      pattern = "['?!;:, \\.\\)\\(\\)]")
+```
+
+Get rid of the extraneous genitive s:
+
+```{r}
+all_tokens <- filter(all_tokens, Word != 's',
+                     complete.cases(Word))
+```
+
+Exclude the "onomatopoeia" place holders:
+
+```{r}
+all_tokens <- filter(all_tokens, !(Word %in% c('noun')))
+```
+
+How many word tokens so far?
+
+```{r}
+nrow(all_tokens)
+```
+
+How many word types?
+
+```{r}
+length(unique(all_tokens$Word))
+```
+
+Get rid of stop words:
+
+```{r}
+all_tokens <- all_tokens %>% anti_join(stop_words, by = c('Word' = 'word'))
+```
+
+How many tokens are left?
+
+```{r}
+nrow(all_tokens)
+```
+
+Lemmatize, but not "high-pitched", "low-pitched" and "far-carrying":
+
+```{r}
+not_these <- c("high-pitched", "low-pitched", "far-carrying")
+all_tokens[!all_tokens$Word %in% not_these, ]$Word <- lemmatize_strings(all_tokens[!all_tokens$Word %in% not_these, ]$Word)
+```
+
+Check most frequent words:
+
+```{r}
+all_counts <- all_tokens %>% count(Word, sort = TRUE)
+all_counts %>% print(n = 30)
+```
+
+
+
+## Timbre words and synesthetic adjectives
+
+Zacharakis et al. (2014) have a nice list of timbre words taken from different studies:
+
+```{r}
+zacharakis <- c('brilliant', 'hollow', 'clear', 'rough',
+                'metallic', 'warm', 'smooth', 'thick',
+                'rounded', 'harsh', 'dull', 'thin',
+                'shrill', 'cold', 'distinct',
+                'sharp', 'rich', 'bright', 'dense',
+                'full', 'nasal', 'soft', 'dark',
+                'compact', 'dirty', 'empty',
+                'messy', 'light', 'dry', 'deep')
+timbre_words <- tibble(Word = zacharakis)
+```
+
+Check how many of those are present:
+
+```{r}
+timbre_words <- mutate(timbre_words,
+                       PresentYesNo = ifelse(Word %in% all_tokens$Word,
+                                             'yes', 'no'))
+```
+
+Tabulate:
+
+```{r}
+timbre_words %>% count(PresentYesNo) %>% 
+  mutate(prop = n / sum(n),
+         prop = round(prop, 2))
+```
+
+Most of them are present, in fact 77% of them. Need to check that "empty" etc. isn't picked up accidentally because of spatial words (e.g., "empty nest"), but "metallic" etc. are also really common.
+
+Which are the ones that aren't in there?
+
+```{r}
+filter(timbre_words, PresentYesNo == 'no')
+```
+
+No temperature metaphors (warm/cold), no filthy-ness metaphors. Either way, I think overall this could be used as an argument that this discourse is heavy on timbre.
+
+Wallmark:
+
+```{r, message = FALSE, warning = FALSE}
+wallmark <- read_csv('../data/other_data/wallmark_2019.csv')
+```
+
+Check how many of those are attested:
+
+```{r}
+wallmark <- mutate(wallmark,
+                   PresentYesNo = ifelse(Word %in% all_tokens$Word,
+                                             'yes', 'no'))
+```
+
+Tabulate:
+
+```{r}
+wallmark %>% count(PresentYesNo) %>% 
+  mutate(prop = n / sum(n),
+         prop = round(prop, 2))
+```
+
+Join and make NA's into 0's (they are true zeros):
+
+```{r}
+wallmark <- left_join(wallmark, all_counts) %>%
+  mutate(n = ifelse(is.na(n), 0, n))
+```
+
+Look at standardized residuals:
+
+```{r}
+wallmark$bird_stdres <- chisq.test(select(wallmark, Frequency, n))$stdres[, 2]
+```
+
+Sort:
+
+```{r}
+# Most over-represented in bird song:
+
+arrange(wallmark, desc(bird_stdres))
+
+# Most under-represented:
+
+arrange(wallmark, bird_stdres)
+```
+
+Check Fritz et al. (2012) descriptors:
+
+```{r, message = FALSE, warning = FALSE}
+fritz <- read_csv('../data/other_data/fritz_et_al_2012_violins.csv')
+```
+
+Check how many of those are attested:
+
+```{r}
+fritz <- mutate(fritz,
+                   PresentYesNo = ifelse(Word %in% all_tokens$Word,
+                                             'yes', 'no'))
+```
+
+Tabulate:
+
+```{r}
+fritz %>% count(PresentYesNo) %>% 
+  mutate(prop = n / sum(n),
+         prop = round(prop, 2))
+```
+
+Check:
+
+```{r}
+fritz %>% filter(PresentYesNo == 'no') %>% print(n = Inf)
+```
+
+We will omit "not penetrating" from the count:
+
+```{r}
+fritz %>% 
+  filter(Word != 'not penetrating') %>% 
+  count(PresentYesNo) %>% 
+  mutate(prop = n / sum(n),
+         prop = round(prop, 2))
+```
+
+
+## Get adjectives only:
+
+Get SUBTLEX POS tags:
+
+```{r, message = FALSE, warning = FALSE}
+SUBTL <- read_csv('../data/other_data/SUBTLEX_US_with_POS.csv')
+```
+
+Merge:
+
+```{r}
+all_tokens <- left_join(all_tokens, select(SUBTL, Word, Dom_PoS_SUBTLEX)) %>% 
+  rename(POS = Dom_PoS_SUBTLEX)
+
+# Make pitch into adjectives:
+
+all_tokens[all_tokens$Word == 'high-pitched', ]$POS <- 'Adjective'
+all_tokens[all_tokens$Word == 'low-pitched', ]$POS <- 'Adjective'
+all_tokens[all_tokens$Word == 'far-carrying', ]$POS <- 'Adjective'
+```
+
+Get adjectives only:
+
+```{r}
+all_adjs <- filter(all_tokens, POS == 'Adjective')
+```
+
+Check frequencies:
+
+```{r}
+adj_counts <- all_adjs %>% count(Word, sort = TRUE)
+```
+
+Get rid of words that do not relate to sound. This is verified by looking at the text. For example, 'diagnostic' refers only to whether a call is diagnostic of the species, it doesn't tell us anything about the song itself. Color words all come from birds names ("blue crested", "red tufted" ...). There's also a bunch of terms about geographical variation in songs.
+
+```{r}
+# utter is a verb (comes from lemmatization)
+non_sound <- c('utter', 'male', 'similar', 'female', 'common',
+               'familiar', 'distinctive', 'territorial',
+               'occasional', 'late', 'diagnostic',
+               'eastern', 'western', 'distinct', 'suggestive',
+               'final', 'juvenile', 'northern', 'yellow',
+               'close', 'european', 'black', 'blue',
+               'pied', 'american', 'introductory',
+               'main', 'considerable',
+               'green', 'conspicuous',
+               'famous', 'grey', 'identical',
+               'wild', 'classic', 'domestic',
+               'geographic', 'outer', 'tufted',
+               'african', 'white', 'alert',
+               'arctic', 'difficult', 'gray',
+               'hooded', 'indigo', 'sardinian',
+               'scientific', 'southern', 'unknown',
+               'average', 'coastal', 'eurasian', 'geographical',
+               'genetic', 'hairy', 'primary', 'scarlet',
+               'solitary', 'slight', 'southeastern',
+               #'unexpected', 'unremarkable',
+               'british', 'arid',
+               'basic', 'primary',
+               'chinese', 'deciduous',
+               'edible', 'erect',
+               'golden', 'glossy',
+               'helmeted', 'normal',
+               'ot', 'northeastern', 'northwestern',
+               'ruddy', 'russian', 'southerly', 'southbound',
+               'total', 'tropical', 'westerly',
+               'vertical', 'usual',
+               'reminiscent',
+               'silent', 'vocal',# these are about _whether_ the bird sings
+               'noticeable',
+               'local') 
+
+# Exclude:
+
+all_adjs <- filter(all_adjs, !(Word %in% non_sound))
+```
+
+Check frequencies again:
+
+```{r}
+adj_counts <- all_adjs %>% count(Word, sort = TRUE)
+```
+
+Distribution of this:
+
+```{r}
+adj_counts %>% ggplot(aes(x = reorder(Word, n), y = n)) +
+  geom_col()
+```
+
+Get rid of all words that do not appear at least five times:
+(arbitrary, seems sensible as we wouldn't want to say anything definite about the semantics of words that we have less than ive instances for, but may want to reconsider this)
+
+```{r}
+frequent_adjs <- filter(adj_counts, n >= 5)
+```
+
+Visualize this:
+
+```{r, fig.width = 8, fig.height = 6}
+wordcloud(word = frequent_adjs$Word, freq = frequent_adjs$n, min.freq = 12,
+          max.words = 120, random.order = FALSE, rot.per = 0.25,
+          colors = brewer.pal(8, 'Dark2'),
+          scale = c(2.5, 0.35))
+```
+
+## Touch-based language
+
+Load in Lynott & Connell (2009):
+
+```{r, message = FALSE, warning = FALSE}
+lyn <- read_csv('../data/other_data/lynott_norms.csv') %>% rename(Word = Property)
+```
+
+Merge with tokens:
+
+```{r}
+lyn_tokens <- left_join(all_tokens, lyn)
+```
+
+Check counts of dominant modality:
+
+```{r}
+lyn_tokens %>% count(DominantModality) %>% 
+  filter(!is.na(DominantModality)) %>% 
+  mutate(prop = n / sum(n),
+         prop = round(prop, 2))
+```
+
+This is interesting. VERY few taste metaphors. Much more touch. A lot of the visuals are going to be dimension words such as "deep" which one may to re-think. Presence of auditory language is expected.
+
+Let's look at how many of the words from the different senses are used in the corpus, using Lynott & Connell (2009) as a baseline?
+
+```{r}
+lyn <- mutate(lyn, UsedYesNo = ifelse(Word %in% all_tokens$Word,
+                                      "yes", "no"))
+```
+
+Check how many per sensory modalitY:
+
+```{r}
+table(lyn$DominantModality, lyn$UsedYesNo)
+```
+
+0 of the smell words are used. Only 3 of the taste words! (mostly sweet probably)
+
+Get the row-wise percentages:
+
+```{r}
+round(prop.table(table(lyn$DominantModality, lyn$UsedYesNo), 1), 2)
+```
+
+What's interesting is that while a lot of the auditory words are very frequent, in terms of how many of the words from the lexicon are used, touch and sound are quite similar!
+
+The fact that smell is not used at all fits Williams (1976) over Shen and overs; smell really is a bad source domain.
+
+## Check token counts per sensory modality:
+
+Add 0 for 0 smell words:
+
+```{r}
+all_adjs <- left_join(all_adjs, lyn)
+
+with(all_adjs, c(table(DominantModality), 0))
+
+with(all_adjs, chisq.test(c(table(DominantModality), 0)))
+
+# Standardized residuals:
+
+with(all_adjs, chisq.test(c(table(DominantModality), 0))$stdres)
+```
+
+Exclusivity:
+
+```{r}
+t.test(all_adjs$ModalityExclusivity[complete.cases(all_adjs$ModalityExclusivity)],
+       lyn$ModalityExclusivity, var.equal = TRUE)
+cohen.d(all_adjs$ModalityExclusivity[complete.cases(all_adjs$ModalityExclusivity)],
+        lyn$ModalityExclusivity)
+```
+
+
+
+## Extract the onomatopoeias:
+
+All onomatopoeias:
+
+```{r}
+all_onoms <- str_extract_all(birds$Voice, '\\".+?\\"')
+birds$AllOnoms <- character(nrow(birds))
+for (i in seq_along(all_onoms)) {
+   this_onoms <- str_replace_all(all_onoms[[i]], '\"', '')
+   if (length(this_onoms) != 0) {
+     birds[i, ]$AllOnoms <- str_c(this_onoms, collapse = '; ')
+   }
+}
+```
+
+Replace "" with NA for easier counting:
+
+```{r}
+birds <- mutate(birds,
+                AllOnoms = ifelse(AllOnoms == '', NA, AllOnoms))
+```
+
+Count:
+
+```{r}
+nrow(birds)
+
+# No onomatopoeia:
+
+nrow(filter(birds, is.na(AllOnoms)))
+
+# Percentage: 
+
+nrow(filter(birds, is.na(AllOnoms))) / nrow(birds)
+
+# With  onomatopoeia:
+
+nrow(filter(birds, !is.na(AllOnoms)))
+
+# Percentage: 
+
+nrow(filter(birds, !is.na(AllOnoms))) / nrow(birds)
+```
+
+
+Compare some of the onomatopeias across different species.
+
+```{r}
+# House sparrow:
+
+filter(birds, EnglishCommon == 'House Sparrow') %>% pull(AllOnoms)
+
+# Common tern:
+
+filter(birds, EnglishCommon == 'Common Tern') %>% pull(AllOnoms)
+
+# Wood sandpiper:
+
+filter(birds, EnglishCommon == 'Wood Sandpiper') %>% pull(AllOnoms)
+
+# Willow warbler:
+
+filter(birds, EnglishCommon == 'Willow Warbler') %>% pull(AllOnoms)
+
+# Whimbrel:
+
+filter(birds, EnglishCommon == 'Whimbrel') %>% pull(AllOnoms)
+
+# Yellow Wagtail:
+
+filter(birds, EnglishCommon == 'Yellow Wagtail') %>% pull(AllOnoms)
+```
+
+Get all unique syllables:
+
+```{r}
+all_units <- birds %>% unnest_tokens(Unit, AllOnoms) %>% pull(Unit)
+all_units <- tibble(Unit = all_units) %>% filter(!is.na(Unit))
+```
+
+Make a count of this:
+
+```{r}
+unit_count <- all_units %>% count(Unit, sort = TRUE)
+unit_count
+```
+
+What are the type and token counts of syllables?
+
+```{r}
+nrow(unit_count) # types
+sum(unit_count$n) # tokens
+```
+
+Make a word cloud of this:
+
+```{r}
+wordcloud(word = unit_count$Unit, freq = unit_count$n, min.freq = 10,
+          max.words = 120, random.order = FALSE, rot.per = 0.25,
+          colors = brewer.pal(8, 'Dark2'))
+```
+
+
+## Try some LSA
+
+Using https://quanteda.io/articles/pkgdown/examples/lsa.html here to guide me.
+
+First, let's get the texts that don't have stop words, and group texts by species (across field guides). We will also make sure that we only take words that occur at least 5 times in the corpus (arbitrary, will have to revisit):
+
+```{r, eval = FALSE}
+# Get words that occur at least three times:
+
+word_counts <- all_tokens %>% count(Word) %>% filter(n >= 5)
+token_min3 <- all_tokens %>% filter(Word %in% word_counts$Word)
+
+# Make this back into a text:
+
+new_texts <- token_min3 %>% group_by(LatinSpecies) %>% 
+  summarize(text = str_c(Word, collapse = ' ')) %>% ungroup()
+
+# Check:
+
+new_texts
+```
+
+Probably need to clean this for non-distinctive words... also no source-terms / bird comparisons etc.
+
+The texts need to have at least 3 words (arbitrary, need to re-asses later).
+
+```{r, eval = FALSE}
+new_texts <- mutate(new_texts, count = str_count(text, pattern = '[a-z]+'))
+
+# Check:
+
+new_texts %>% count(count)
+
+# Exclude:
+
+new_texts <- filter(new_texts, count >= 3)
+
+# Double-check:
+
+new_texts
+```
+
+First, take the voice descriptions and create a term-document matrix (which is a term-bird matrix here...):
+
+```{r, eval = FALSE}
+txt <- new_texts$text
+mydfm <- dfm(txt)
+
+# Check:
+
+mydfm
+```
+
+This is still VERY sparse, despite the exclusions. Will have to re-think this...
+
+Create LSA model:
+
+```{r, eval = FALSE}
+mylsa <- textmodel_lsa(mydfm)
+```
+
+Get the features (= words?):
+
+```{r, eval = FALSE}
+features <- mylsa$features
+all_words <- row.names(features)
+```
+
+Check the LSA fun package:
+
+```{r, eval = FALSE}
+Cosine('thin', 'high-pitched', tvectors = mylsa$features)
+```
+
+Thin and high-pitched are almost synonymous according their cosine!!!
+
+Check neighbors:
+
+```{r, eval = FALSE}
+neighbors('thin', n = 20, tvectors = mylsa$features)
+```
+
+Interesting, "high-pitched" is the word that is MOST closely associated with "thin".
+
+O.k., so there's lots of irrelevant words in there that need to be excluded... probably want it to be focused on adjectives only?
+
+```{r, eval = FALSE}
+neighbors('soft', n = 20, tvectors = mylsa$features)
+```
+
+Soft and quiet makes sense! Seems to be more loudness... And soft and softly...
+
+```{r, eval = FALSE}
+neighbors('harsh', n = 20, tvectors = mylsa$features)
+```
+
+Some of this makes sense (caw, hissings, abrupt, chatter ...); there is definitely some isolated words (like cartwheel, a hapax legomenon) that need to be excluded.
+
+Plot some words:
+
+```{r, eval = FALSE}
+words <- c('loud', 'quiet', 'soft', 'high-pitched', 'thin', 'harsh', 'rough',
+           'dull', 'mellow', 'plaintive', 'abrupt', 'sharp', 'chatter',
+           'twitter', 'whistle', 'shrill', 'squeak', 'squeal', 'squeaky',
+           'screech', 'metallic', 'musical', 'melodious', 
+           'clear', 'pleasant', 'noisy', 'rich', 'nasal', 'deep',
+           'low-pitched', 'low', 'high', 'piping', 'faint', 'rhythmic')
+
+plot_wordlist(words, method = "MDS", dims = 2, tvectors = mylsa$features)
+```
+
+Some of this makes sense... mellow, plaintive, rich, whistle, musical, melodious all seem pitch-based and are in one corner, abrupt, harsh, rough, and low-pitched are together as well.
+
+If I was to run a cluster analysis on this:
+
+```{r, fig.width = 8, fig.height = 6, eval = FALSE}
+x <- plot_wordlist(words, method = "MDS", dims = 2, tvectors = mylsa$features)
+plot(hclust(dist(x)))
+```
+
+This could produce interesting results, with more thought!
+
+Perform clustering on the raw LSA features (not sure if this makes sense; also not decided yet that this is the best clustering algorithm):
+
+```{r, eval = FALSE}
+gauss <- Mclust(features)
+```
+
+Add cluster classifications to word list:
+
+```{r, eval = FALSE}
+myclusts <- tibble(Word = all_words, Cluster = gauss$classification,
+                   Uncertainty = gauss$uncertainty)
+
+# Sort according to cluster and by uncertainty:
+
+myclusts <- arrange(myclusts, Cluster, Uncertainty)
+```
+
+Check:
+
+```{r, eval = FALSE}
+# First cluster:
+
+filter(myclusts, Cluster == 1)
+
+# Second:
+
+filter(myclusts, Cluster == 2)
+
+# Third:
+
+filter(myclusts, Cluster == 3)
+
+# Fourth:
+
+filter(myclusts, Cluster == 4)
+
+# Fifth:
+
+filter(myclusts, Cluster == 5)
+
+# Sixth:
+
+filter(myclusts, Cluster == 6)
+
+# Seven:
+
+filter(myclusts, Cluster == 7)
+
+# Eight:
+
+filter(myclusts, Cluster == 8)
+```
+
+Can't make much sense of this YET. Shows that the dataset is quite contaminated still, with some things that appear to be typos, and also species names and things relating to behavior and position rather than sound.
+
+Some stuff makes sense though and needs to be re-thought in terms of exclusions. Cluster 3 is clearly the highly generic words that occur across all or many texts (call, song, note, whistle, male, silent)...
+
+
+
+## LSA on adjectives only:
+
+Using https://quanteda.io/articles/pkgdown/examples/lsa.html here to guide me.
+
+Merge the adjectives together into text by species for LSA:
+
+```{r, eval = FALSE}
+# Take only adjs with >5 tokens:
+
+# all_adjs <- filter(all_adjs, Word %in% frequent_adjs$Word)
+
+# Merge:
+
+adjs_by_species <- all_adjs %>% group_by(LatinSpecies) %>% 
+  summarize(text = str_c(Word, collapse = ' ')) %>% ungroup()
+
+# Check:
+
+adjs_by_species
+```
+
+The texts need to have at least 3 words (arbitrary, need to re-asses later).
+
+```{r, eval = FALSE}
+adjs_by_species <- mutate(adjs_by_species,
+                          count = str_count(text, pattern = '[a-z]+'))
+
+# Check:
+
+adjs_by_species %>% count(count)
+
+# Exclude:
+
+adjs_by_species <- filter(adjs_by_species, count >= 3)
+
+# Double-check:
+
+adjs_by_species
+```
+
+First, take the voice descriptions and create a term-document matrix (which is a term-bird matrix here...):
+
+```{r, eval = FALSE}
+txt <- adjs_by_species$text
+mydfm <- dfm(txt)
+
+# Check:
+
+mydfm
+```
+
+Create LSA model:
+
+```{r, eval = FALSE}
+mylsa <- textmodel_lsa(mydfm)
+```
+
+Get the features (= words?):
+
+```{r, eval = FALSE}
+features <- mylsa$features
+all_words <- row.names(features)
+```
+
+Check the LSA fun package:
+
+```{r, eval = FALSE}
+Cosine('thin', 'high-pitched', tvectors = mylsa$features)
+```
+
+Thin and high-pitched are almost synonymous according their cosine!!!
+
+Check neighbors:
+
+```{r, eval = FALSE}
+neighbors('thin', n = 20, tvectors = mylsa$features)
+```
+
+Interesting, "high-pitched" is the word that is MOST closely associated with "thin".
+
+O.k., so there's lots of irrelevant words in there that need to be excluded... probably want it to be focused on adjectives only?
+
+```{r, eval = FALSE}
+neighbors('soft', n = 20, tvectors = mylsa$features)
+```
+
+Soft and quiet makes sense! Seems to be more loudness... And soft and softly...
+
+```{r, eval = FALSE}
+neighbors('harsh', n = 20, tvectors = mylsa$features)
+```
+
+Some of this makes sense (caw, hissings, abrupt, chatter ...); there is definitely some isolated words (like cartwheel, a hapax legomenon) that need to be excluded.
+
+Plot some words:
+
+```{r, eval = FALSE}
+words <- c('deep', 'full', 'mellow', 'nasal', 'piercing',
+           'raspy', 'shrill', 'ringing', 'sweet',
+           'weak', 'clear', 'dull', 'hard', 'abrupt',
+           'metallic', 'penetrating', 'rough',
+           'thin', 'harsh',
+           'smooth', 'strident',
+           'loud', 'quiet', 'high-pitched',
+           'low-pitched', 'high', 'low',
+           'soft', 'sharp', 'strong', 'weak', 'feeble',
+           'creaky', 'chirpy', 'quiet', 'bright',
+           'delicate', 'elegant', 'melodious',
+           'musical', 'unmelodious', 'silvery',
+           'gentle', 'exuberant', 'angry',
+           'scolding', 'excited', 'lyrical',
+           'catlike', 'raucous',
+           'breezy', 'whiny', 'nasal',
+           'wheezy', 'cacophonous',
+           'squeaky', 'wooden',
+           'strident', 'guttural',
+           'throaty', 'ventriloquial')
+
+plot_wordlist(words, method = "MDS", dims = 3, tvectors = mylsa$features)
+```
+
+Some of this makes sense... mellow, plaintive, rich, whistle, musical, melodious all seem pitch-based and are in one corner, abrupt, harsh, rough, and low-pitched are together as well.
+
+If I was to run a cluster analysis on this:
+
+```{r, fig.width = 8, fig.height = 6, eval = FALSE}
+x <- plot_wordlist(words, method = "MDS", dims = 2, tvectors = mylsa$features)
+plot(hclust(dist(x)))
+```
+
+This could produce interesting results, with more thought!
+
+Perform clustering on the raw LSA features (not sure if this makes sense; also not decided yet that this is the best clustering algorithm):
+
+```{r, eval = FALSE}
+gauss <- Mclust(features)
+```
+
+Add cluster classifications to word list:
+
+```{r, eval = FALSE}
+myclusts <- tibble(Word = all_words, Cluster = gauss$classification,
+                   Uncertainty = gauss$uncertainty)
+
+# Sort according to cluster and by uncertainty:
+
+myclusts <- arrange(myclusts, Cluster, Uncertainty)
+```
+
+Check:
+
+```{r, eval = FALSE}
+# First cluster:
+
+filter(myclusts, Cluster == 1)
+
+# Second:
+
+filter(myclusts, Cluster == 2)
+
+# Third:
+
+filter(myclusts, Cluster == 3)
+
+# Fourth:
+
+filter(myclusts, Cluster == 4)
+
+# Fifth:
+
+filter(myclusts, Cluster == 5)
+```
+
+Can't make much sense of this YET. Shows that the dataset is quite contaminated still, with some things that appear to be typos, and also species names and things relating to behavior and position rather than sound.
+
+Some stuff makes sense though and needs to be re-thought in terms of exclusions. Cluster 3 is clearly the highly generic words that occur across all or many texts (call, song, note, whistle, male, silent)...
+
+
+
+
